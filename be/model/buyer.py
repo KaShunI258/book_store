@@ -1,189 +1,433 @@
-import sqlite3 as sqlite
+import pymongo
 import uuid
 import json
 import logging
+import threading
 from be.model import db_conn
 from be.model import error
 
 
 class Buyer(db_conn.DBConn):
     def __init__(self):
+        # 初始化数据库连接
         db_conn.DBConn.__init__(self)
+        self.timer = None  # 用于订单超时取消的计时器
+
 
     def new_order(
-        self, user_id: str, store_id: str, id_and_count: [(str, int)]
+            self, user_id: str, store_id: str, id_and_count: [(str, int)]
     ) -> (int, str, str):
+        """
+        创建新订单
+        参数:
+            user_id: 用户ID
+            store_id: 店铺ID
+            id_and_count: [(book_id, count)] 书籍ID与数量列表
+        返回:
+            (状态码, 信息, 订单ID)
+        """
         order_id = ""
         try:
+            # 验证用户与店铺是否存在
             if not self.user_id_exist(user_id):
                 return error.error_non_exist_user_id(user_id) + (order_id,)
             if not self.store_id_exist(store_id):
                 return error.error_non_exist_store_id(store_id) + (order_id,)
+
+            # 构造唯一订单ID
             uid = "{}_{}_{}".format(user_id, store_id, str(uuid.uuid1()))
 
+            order_details = []
+
+            # 遍历每本书，检查库存与价格
             for book_id, count in id_and_count:
-                cursor = self.conn.execute(
-                    "SELECT book_id, stock_level, book_info FROM store "
-                    "WHERE store_id = ? AND book_id = ?;",
-                    (store_id, book_id),
-                )
-                row = cursor.fetchone()
-                if row is None:
+                book = self.conn["store"].find_one({"store_id": store_id, "book_id": book_id})
+                if not book:
                     return error.error_non_exist_book_id(book_id) + (order_id,)
 
-                stock_level = row[1]
-                book_info = row[2]
-                book_info_json = json.loads(book_info)
-                price = book_info_json.get("price")
-
+                stock_level = book["stock_level"]
                 if stock_level < count:
                     return error.error_stock_level_low(book_id) + (order_id,)
 
-                cursor = self.conn.execute(
-                    "UPDATE store set stock_level = stock_level - ? "
-                    "WHERE store_id = ? and book_id = ? and stock_level >= ?; ",
-                    (count, store_id, book_id, count),
-                )
-                if cursor.rowcount == 0:
+                # 更新库存
+                query = {"book_id": book_id, "store_id": store_id, "stock_level": {"$gte": count}}
+                update = {"$inc": {"stock_level": -count}}
+                result = self.conn["store"].update_one(query, update)
+                if result.modified_count == 0:
                     return error.error_stock_level_low(book_id) + (order_id,)
 
-                self.conn.execute(
-                    "INSERT INTO new_order_detail(order_id, book_id, count, price) "
-                    "VALUES(?, ?, ?, ?);",
-                    (uid, book_id, count, price),
-                )
+                # 计算书籍总价
+                book_info = json.loads(book["book_info"])
+                price = book_info.get("price") * count
 
-            self.conn.execute(
-                "INSERT INTO new_order(order_id, store_id, user_id) "
-                "VALUES(?, ?, ?);",
-                (uid, store_id, user_id),
-            )
-            self.conn.commit()
+                # 生成订单详情项
+                new_order_detail = {
+                    "order_id": uid,
+                    "book_id": book_id,
+                    "count": count,
+                    "price": price
+                }
+                order_details.append(new_order_detail)
+
+            # 插入订单详情
+            if len(order_details) > 0:
+                self.conn["new_order_detail"].insert_many(order_details)
+
+            # 插入订单主表
+            order = {"order_id": uid, "user_id": user_id, "store_id": store_id}
+            self.conn["new_order"].insert_one(order)
             order_id = uid
-        except sqlite.Error as e:
-            logging.info("528, {}".format(str(e)))
-            return 528, "{}".format(str(e)), ""
+
+            # 新功能：10秒后自动取消未支付订单
+            self.timer = threading.Timer(10.0, self.cancel_order, args=[user_id, order_id])
+            self.timer.start()
+
+            # 新功能：添加订单历史记录
+            order["status"] = "pending"  # 初始状态为待支付
+            self.conn["order_history"].insert_one(order)
+            self.conn["order_history_detail"].insert_many(order_details)
+
+        except pymongo.errors.PyMongoError as e:
+            logging.error("528, {}".format(str(e)))
+            return 528, str(e), ""
         except BaseException as e:
             logging.info("530, {}".format(str(e)))
-            return 530, "{}".format(str(e)), ""
+            return 530, str(e), ""
 
         return 200, "ok", order_id
 
+
     def payment(self, user_id: str, password: str, order_id: str) -> (int, str):
-        conn = self.conn
+        """
+        用户支付订单
+        参数:
+            user_id: 用户ID
+            password: 密码
+            order_id: 订单ID
+        """
         try:
-            cursor = conn.execute(
-                "SELECT order_id, user_id, store_id FROM new_order WHERE order_id = ?",
-                (order_id,),
-            )
-            row = cursor.fetchone()
-            if row is None:
+            conn = self.conn
+
+            # 查找订单
+            order = conn["new_order"].find_one({"order_id": order_id})
+            if not order:
                 return error.error_invalid_order_id(order_id)
 
-            order_id = row[0]
-            buyer_id = row[1]
-            store_id = row[2]
-
-            if buyer_id != user_id:
+            # 检查订单归属
+            if order["user_id"] != user_id:
                 return error.error_authorization_fail()
 
-            cursor = conn.execute(
-                "SELECT balance, password FROM user WHERE user_id = ?;", (buyer_id,)
-            )
-            row = cursor.fetchone()
-            if row is None:
-                return error.error_non_exist_user_id(buyer_id)
-            balance = row[0]
-            if password != row[1]:
+            # 校验买家信息与密码
+            buyer = conn["user"].find_one({"user_id": user_id})
+            if not buyer:
+                return error.error_non_exist_user_id(user_id)
+            if password != buyer["password"]:
                 return error.error_authorization_fail()
 
-            cursor = conn.execute(
-                "SELECT store_id, user_id FROM user_store WHERE store_id = ?;",
-                (store_id,),
+            # 检查订单状态是否仍为待支付
+            if conn["order_history"].find_one({"order_id": order_id})["status"] != "pending":
+                error.error_invalid_order_status(order_id)
+
+            # 取消定时器（避免订单被自动取消）
+            if self.timer is not None:
+                self.timer.cancel()
+
+            # 计算订单总价
+            total_price = sum(detail["price"] for detail in conn["new_order_detail"].find({"order_id": order_id}))
+
+            # 检查用户余额是否充足
+            if buyer["balance"] < total_price:
+                return error.error_not_sufficient_funds(order_id)
+
+            # 扣除买家余额
+            result = conn["user"].update_one(
+                {"user_id": user_id, "balance": {"$gte": total_price}},
+                {"$inc": {"balance": -total_price}}
             )
-            row = cursor.fetchone()
-            if row is None:
-                return error.error_non_exist_store_id(store_id)
+            if result.modified_count == 0:
+                return error.error_not_sufficient_funds(order_id)
 
-            seller_id = row[1]
-
+            # 给卖家加钱
+            seller_id = conn["user_store"].find_one({"store_id": order["store_id"]})["user_id"]
             if not self.user_id_exist(seller_id):
                 return error.error_non_exist_user_id(seller_id)
+            result = conn["user"].update_one({"user_id": seller_id}, {"$inc": {"balance": total_price}})
 
-            cursor = conn.execute(
-                "SELECT book_id, count, price FROM new_order_detail WHERE order_id = ?;",
-                (order_id,),
-            )
-            total_price = 0
-            for row in cursor:
-                count = row[1]
-                price = row[2]
-                total_price = total_price + price * count
+            # 删除临时订单数据
+            conn["new_order"].delete_one({"order_id": order_id})
+            conn["new_order_detail"].delete_many({"order_id": order_id})
 
-            if balance < total_price:
-                return error.error_not_sufficient_funds(order_id)
+            # 更新订单状态为已支付
+            conn["order_history"].update_one({"order_id": order_id}, {"$set": {"status": "paid"}})
 
-            cursor = conn.execute(
-                "UPDATE user set balance = balance - ?"
-                "WHERE user_id = ? AND balance >= ?",
-                (total_price, buyer_id, total_price),
-            )
-            if cursor.rowcount == 0:
-                return error.error_not_sufficient_funds(order_id)
-
-            cursor = conn.execute(
-                "UPDATE user set balance = balance + ?" "WHERE user_id = ?",
-                (total_price, seller_id),
-            )
-
-            if cursor.rowcount == 0:
-                return error.error_non_exist_user_id(seller_id)
-
-            cursor = conn.execute(
-                "DELETE FROM new_order WHERE order_id = ?", (order_id,)
-            )
-            if cursor.rowcount == 0:
-                return error.error_invalid_order_id(order_id)
-
-            cursor = conn.execute(
-                "DELETE FROM new_order_detail where order_id = ?", (order_id,)
-            )
-            if cursor.rowcount == 0:
-                return error.error_invalid_order_id(order_id)
-
-            conn.commit()
-
-        except sqlite.Error as e:
-            return 528, "{}".format(str(e))
-
+        except pymongo.errors.PyMongoError as e:
+            return 528, str(e)
         except BaseException as e:
-            return 530, "{}".format(str(e))
+            return 530, str(e)
 
         return 200, "ok"
+
 
     def add_funds(self, user_id, password, add_value) -> (int, str):
+        """
+        用户充值
+        参数:
+            user_id: 用户ID
+            password: 密码
+            add_value: 充值金额
+        """
         try:
-            cursor = self.conn.execute(
-                "SELECT password  from user where user_id=?", (user_id,)
-            )
-            row = cursor.fetchone()
-            if row is None:
+            conn = self.conn
+            user = conn["user"].find_one({"user_id": user_id})
+            if not user or user["password"] != password:
                 return error.error_authorization_fail()
 
-            if row[0] != password:
-                return error.error_authorization_fail()
-
-            cursor = self.conn.execute(
-                "UPDATE user SET balance = balance + ? WHERE user_id = ?",
-                (add_value, user_id),
-            )
-            if cursor.rowcount == 0:
+            # 增加余额
+            result = conn["user"].update_one({"user_id": user_id}, {"$inc": {"balance": add_value}})
+            if result.modified_count == 0:
                 return error.error_non_exist_user_id(user_id)
 
-            self.conn.commit()
-        except sqlite.Error as e:
-            return 528, "{}".format(str(e))
+        except pymongo.errors.PyMongoError as e:
+            return 528, str(e)
         except BaseException as e:
+            return 530, str(e)
+
+        return 200, "ok"
+
+
+    def get_order_history(self, user_id: str) -> (int, str, [dict]):
+        """
+        获取用户历史订单
+        """
+        try:
+            conn = self.conn
+            user = conn["user"].find_one({"user_id": user_id})
+            if not user:
+                return error.error_non_exist_user_id(user_id) + ([],)
+
+            # 聚合查询订单与对应详情
+            orders = conn["order_history"].aggregate([
+                {"$match": {"user_id": user_id}},
+                {"$lookup": {
+                    "from": "order_history_detail",
+                    "localField": "order_id",
+                    "foreignField": "order_id",
+                    "as": "order_details"
+                }}
+            ])
+
+            if not orders:
+                return 200, "Blank order list!" + ([],)
+
+            order_list = []
+            for order in orders:
+                order_id = order["order_id"]
+                order_detail_list = []
+                for detail in order["order_details"]:
+                    order_detail_list.append({
+                        "book_id": detail["book_id"],
+                        "count": detail["count"],
+                        "price": detail["price"]
+                    })
+                order_list.append({
+                    "order_id": order_id,
+                    "order_detail": order_detail_list
+                })
+
+        except pymongo.errors.PyMongoError as e:
+            return 528, str(e), []
+        except BaseException as e:
+            return 530, str(e), []
+
+        return 200, "ok", order_list
+
+
+    def cancel_order(self, user_id: str, order_id: str) -> (int, str):
+        """
+        自动/手动取消未支付订单
+        """
+        try:
+            order = self.conn["new_order"].find_one({"order_id": order_id})
+            if not order:
+                return error.error_invalid_order_id(order_id)
+
+            if order["user_id"] != user_id:
+                return error.error_authorization_fail()
+
+            if self.conn["order_history"].find_one({"order_id": order_id})["status"] != "pending":
+                return error.error_invalid_order_status(order_id)
+
+            # 删除订单及详情
+            self.conn["new_order"].delete_one({"order_id": order_id})
+            self.conn["new_order_detail"].delete_many({"order_id": order_id})
+
+            # 更新历史状态
+            self.conn["order_history"].update_one({"order_id": order_id}, {"$set": {"status": "cancelled"}})
+
+        except pymongo.errors.PyMongoError as e:
+            return 528, str(e)
+        except BaseException as e:
+            return 530, str(e)
+
+        return 200, "ok"
+
+
+    def receive_order(self, user_id: str, order_id: str) -> (int, str):
+        """
+        用户确认收货
+        """
+        try:
+            conn = self.conn
+            order = conn["order_history"].find_one({"order_id": order_id})
+            if not order:
+                return error.error_invalid_order_id(order_id)
+
+            if order["user_id"] != user_id:
+                return error.error_authorization_fail()
+
+            # 仅已发货订单可收货
+            if order["status"] != "shipped":
+                return error.error_not_shipped(order_id)
+
+            # 更新状态为已收货
+            conn["order_history"].update_one({"order_id": order_id}, {"$set": {"status": "received"}})
+
+        except pymongo.errors.PyMongoError as e:
+            return 528, str(e)
+        except BaseException as e:
+            return 530, str(e)
+
+        return 200, "ok"
+
+
+    def collect_book(self, user_id, book_id):
+        """
+        收藏图书
+        """
+        try:
+            existing_user = self.conn['user'].find_one({"user_id": user_id})
+            if not existing_user:
+                return error.error_non_exist_user_id(user_id)
+
+            if (book_id) in existing_user.get("collection", []):
+                return 200, "book already in collection"
+
+            # 添加收藏
+            self.conn['user'].update_one(
+                {"_id": user_id},
+                {"$addToSet": {"collection": (book_id)}}
+            )
+        except pymongo.errors.PyMongoError as e:
+            return 528, str(e)
+        except Exception as e:
             return 530, "{}".format(str(e))
 
         return 200, "ok"
+
+
+    def uncollect_book(self, user_id, book_id):
+        """
+        取消收藏图书
+        """
+        try:
+            existing_user = self.conn['user'].find_one({"user_id": user_id})
+            if not existing_user:
+                return error.error_non_exist_user_id(user_id)
+
+            self.conn['user'].update_one(
+                {"_id": user_id},
+                {"$pull": {"collection": (book_id)}}
+            )
+        except pymongo.errors.PyMongoError as e:
+            return 528, str(e)
+        except Exception as e:
+            return 530, "{}".format(str(e))
+
+        return 200, "ok"
+
+
+    def get_collection(self, user_id):
+        """
+        获取用户收藏的书籍
+        """
+        try:
+            existing_user = self.conn['user'].find_one({"user_id": user_id})
+            if not existing_user:
+                return error.error_non_exist_user_id(user_id)
+
+            collection = existing_user.get("collection", [])
+        except pymongo.errors.PyMongoError as e:
+            return 528, str(e)
+        except Exception as e:
+            return 530, "{}".format(str(e))
+
+        if not collection:
+            return 200, "empty collection"
+        else:
+            return 200, collection
+
+
+    def collect_store(self, user_id, store_id):
+        """
+        收藏店铺
+        """
+        try:
+            existing_user = self.conn['user'].find_one({"user_id": user_id})
+            if not existing_user:
+                return error.error_non_exist_user_id(user_id)
+
+            if store_id in existing_user.get("store_collection", []):
+                return 200, "store already in collection"
+
+            self.conn['user'].update_one(
+                {"_id": user_id},
+                {"$addToSet": {"store_collection": store_id}}
+            )
+        except pymongo.errors.PyMongoError as e:
+            return 528, str(e)
+        except Exception as e:
+            return 530, "{}".format(str(e))
+
+        return 200, "ok"
+
+
+    def uncollect_store(self, user_id, store_id):
+        """
+        取消收藏店铺
+        """
+        try:
+            existing_user = self.conn['user'].find_one({"user_id": user_id})
+            if not existing_user:
+                return error.error_non_exist_user_id(user_id)
+
+            self.conn['user'].update_one(
+                {"_id": user_id},
+                {"$pull": {"store_collection": store_id}}
+            )
+        except pymongo.errors.PyMongoError as e:
+            return 528, str(e)
+        except Exception as e:
+            return 530, "{}".format(str(e))
+
+        return 200, "ok"
+
+
+    def get_store_collection(self, user_id):
+        """
+        获取用户收藏的店铺
+        """
+        try:
+            existing_user = self.conn['user'].find_one({"user_id": user_id})
+            if not existing_user:
+                return error.error_non_exist_user_id(user_id)
+
+            store_collection = existing_user.get("store_collection", [])
+        except pymongo.errors.PyMongoError as e:
+            return 528, str(e)
+        except Exception as e:
+            return 530, "{}".format(str(e))
+
+        if not store_collection:
+            return 200, "empty store_collection"
+        else:
+            return 200, store_collection
